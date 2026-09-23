@@ -12,6 +12,7 @@ Sources of truth:
 - `backend/docs/TOKEN_REFRESH_SECURITY_GUIDE.md`
 - `backend/docs/ADR-002-games-realtime-transport.md`
 - `frontend/docs/ADR-004-session-tokens-httpOnly-cookies.md`
+- `frontend/docs/NEAR_WALLET_TESTNET_CHECKLIST.md`
 - `backend/test/auth-token-security.e2e-spec.ts`
 - `backend/test/auth.e2e-spec.ts`
 
@@ -183,14 +184,47 @@ These codes are part of the client contract and must remain stable.
 - [ ] Fail-closed on dependency outage (Postgres/Redis/shop-api/RPC) for writes.
 - [ ] Deny-by-default for new WS/action surfaces.
 
-## 16. Verification
+## 16. End-to-end testnet proof (NEAR login → create/join → finish → claim)
 
-- `backend/test/auth-token-security.e2e-spec.ts` — rotation, reuse detection,
-  family revocation, cookie flags, CSRF.
-- `backend/test/auth.e2e-spec.ts` — login, refresh, logout, role access.
-- Unit tests — signature verification negatives, replayed nonce, forged
-  `account_id`; authz matrix for seat vs spectator.
-- E2E — join / roll / reconnect, including `game-idempotency.e2e`.
-- Confirm cookie-only, header-only, and both-present handshakes all succeed and
-  resolve to the same principal.
-- Frontend RTL — wallet reject path creates no session.
+This section is the runbook for issue #1809: proving the full player journey on
+NEAR testnet end to end. It ties the auth flows above to the checklist in
+`frontend/docs/NEAR_WALLET_TESTNET_CHECKLIST.md`.
+
+### 16.1 Journey stages
+
+1. **NEAR login** — challenge/nonce issued (§6), signature verified with domain
+   separation and `account_id` binding, session established as httpOnly cookies
+   (§1). No JS-readable access token is ever produced.
+2. **Create / join** — cookie-authenticated mutation (§5 CSRF) with an
+   idempotency key (§12). Duplicate create/join retries must resolve to the same
+   game, never a second one.
+3. **Finish** — server is the source of truth for the outcome; clients submit
+   intents only (§9).
+4. **Claim** — cookie-authenticated mutation (§5), authorized for the claiming
+   principal, idempotent so a retried claim cannot double-pay.
+
+### 16.2 Proof requirements
+
+- The journey is exercised by `auth.e2e-spec.ts` and
+  `auth-token-security.e2e-spec.ts`, plus the frontend RTL wallet-reject path.
+- Forged account sessions must be impossible: a signature that does not bind the
+  claimed `account_id`, or that fails domain separation, is rejected.
+- Replayed nonces and parallel refreshes are rejected per §4 and §6.
+- `returnTo` redirects are allowlisted per §7; open-redirect attempts fail.
+
+### 16.3 Failure modes specific to the journey
+
+| Condition                     | Behavior                                        |
+| ----------------------------- | ----------------------------------------------- |
+| User rejects NEAR signature   | No session; nonce discarded; no cookies set     |
+| Replayed nonce                | `401`, nonce already consumed                   |
+| Parallel refresh              | One succeeds, others treated as reuse (§4)      |
+| Open redirect `returnTo`      | `400`, redirect refused                         |
+| Dependency outage on claim    | Fail closed, `503`, no state change             |
+
+### 16.4 Acceptance criteria
+
+- [ ] Forged account sessions impossible.
+- [ ] Cookie/CSRF story complete.
+- [ ] `NEAR_WALLET_TESTNET_CHECKLIST.md` updated.
+- [ ] e2e green.
