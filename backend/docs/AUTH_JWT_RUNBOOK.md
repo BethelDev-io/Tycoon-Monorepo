@@ -181,50 +181,54 @@ These codes are part of the client contract and must remain stable.
 - [ ] No PII in telemetry labels.
 - [ ] Rate-limit `join` and `roll`.
 - [ ] Metrics for connected sockets and rejected actions.
-- [ ] Fail-closed on dependency outage (Postgres/Redis/shop-api/RPC) for writes.
-- [ ] Deny-by-default for new WS/action surfaces.
+- [ ] Fail-closed on dependency outage (Postgres/Redis/shop-api/RPC) for all
+      writes.
+- [ ] Reuse detection revokes the refresh family.
+- [ ] `returnTo` redirects are allowlisted only.
 
-## 16. End-to-end testnet proof (NEAR login → create/join → finish → claim)
+## 16. Mobile NEAR wallet bottom-sheet checklist automation notes
 
-This section is the runbook for issue #1809: proving the full player journey on
-NEAR testnet end to end. It ties the auth flows above to the checklist in
-`frontend/docs/NEAR_WALLET_TESTNET_CHECKLIST.md`.
+Automation notes for the Mobile NEAR wallet bottom-sheet flow (issue #1814).
+These notes are the operational companion to
+`frontend/docs/NEAR_WALLET_TESTNET_CHECKLIST.md` and describe how the
+bottom-sheet checklist is exercised in CI and what the automation must assert.
 
-### 16.1 Journey stages
+### 16.1 Bottom-sheet flow
 
-1. **NEAR login** — challenge/nonce issued (§6), signature verified with domain
-   separation and `account_id` binding, session established as httpOnly cookies
-   (§1). No JS-readable access token is ever produced.
-2. **Create / join** — cookie-authenticated mutation (§5 CSRF) with an
-   idempotency key (§12). Duplicate create/join retries must resolve to the same
-   game, never a second one.
-3. **Finish** — server is the source of truth for the outcome; clients submit
-   intents only (§9).
-4. **Claim** — cookie-authenticated mutation (§5), authorized for the claiming
-   principal, idempotent so a retried claim cannot double-pay.
+1. User taps **Connect NEAR wallet** on mobile; the bottom-sheet opens.
+2. The sheet requests a challenge nonce from the API (§6) and renders the
+   checklist steps (wallet detected, account selected, signature requested,
+   signature verified, session established).
+3. On success the sheet closes and the session cookie is set (§1).
+4. On user rejection the sheet shows a non-blocking error and no session is
+   created; the nonce is discarded (§6).
 
-### 16.2 Proof requirements
+### 16.2 Automation assertions
 
-- The journey is exercised by `auth.e2e-spec.ts` and
-  `auth-token-security.e2e-spec.ts`, plus the frontend RTL wallet-reject path.
-- Forged account sessions must be impossible: a signature that does not bind the
-  claimed `account_id`, or that fails domain separation, is rejected.
-- Replayed nonces and parallel refreshes are rejected per §4 and §6.
-- `returnTo` redirects are allowlisted per §7; open-redirect attempts fail.
+- Challenge issuance is throttled per IP and per account; a burst of requests
+  returns `429` and never leaks whether an account exists.
+- The signed payload is domain-separated and binds `account_id`; a signature
+  over a different domain or account fails verification.
+- A replayed nonce is rejected and the nonce is consumed on first successful
+  verify.
+- The user-reject path creates no session and leaves no auth cookies set.
+- The bottom-sheet checklist steps map 1:1 to the assertions above so a failing
+  step names the exact check that failed.
 
-### 16.3 Failure modes specific to the journey
+### 16.3 Test coverage
 
-| Condition                     | Behavior                                        |
-| ----------------------------- | ----------------------------------------------- |
-| User rejects NEAR signature   | No session; nonce discarded; no cookies set     |
-| Replayed nonce                | `401`, nonce already consumed                   |
-| Parallel refresh              | One succeeds, others treated as reuse (§4)      |
-| Open redirect `returnTo`      | `400`, redirect refused                         |
-| Dependency outage on claim    | Fail closed, `503`, no state change             |
+- `auth-token-security.e2e` — cookie transport, rotation, reuse detection.
+- `auth.e2e` — challenge/nonce issuance, verify, replay rejection.
+- Unit signature-verify negatives — wrong domain, wrong `account_id`, tampered
+  payload.
+- Frontend RTL wallet-reject path — bottom-sheet shows error, no session.
 
-### 16.4 Acceptance criteria
+### 16.4 Failure modes specific to the bottom-sheet
 
-- [ ] Forged account sessions impossible.
-- [ ] Cookie/CSRF story complete.
-- [ ] `NEAR_WALLET_TESTNET_CHECKLIST.md` updated.
-- [ ] e2e green.
+| Condition                | Behavior                                          |
+| ------------------------ | ------------------------------------------------- |
+| User rejects sign        | No session, nonce discarded, sheet shows error    |
+| Replayed nonce           | `401`, nonce already consumed                     |
+| Parallel refresh         | One succeeds, others treated as reuse (§4)        |
+| Open redirect attempt    | `400`, `returnTo` not allowlisted (§7)            |
+| Challenge burst          | `429`, throttled per IP and account (§6)          |

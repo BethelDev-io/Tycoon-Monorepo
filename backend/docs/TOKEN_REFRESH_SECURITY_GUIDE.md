@@ -246,87 +246,106 @@ const ALLOWED_RETURN_PREFIXES = ['/', '/games', '/shop', '/profile'];
 
 function safeReturnTo(value: string | undefined): string {
   if (!value || !value.startsWith('/') || value.startsWith('//')) return '/';
-  return ALLOWED_RETURN_PREFIXES.some((p) => value === p || value.startsWith(`${p}/`))
-    ? value
-    : '/';
+  if (value.includes('\\')) return '/';
+  const normalized = new URL(value, 'https://tycoon.example').pathname;
+  const allowed = ALLOWED_RETURN_PREFIXES.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`),
+  );
+  return allowed ? normalized : '/';
 }
 ```
 
-## NEAR Wallet Login: Challenge/Nonce & Signature Verification (issue #1809)
+Rules:
 
-NEAR wallet is the only supported chain UI (ADR-003). The login flow is:
+- Only same-origin, path-relative targets are accepted.
+- Absolute (`https://evil.com`), protocol-relative (`//evil.com`), and
+  backslash-smuggled (`/\evil.com`) values fall back to `/`.
+- The allowlist is deny-by-default: new destinations must be added explicitly.
 
-1. `POST /api/v1/auth/near/challenge` — server issues a single-use nonce bound
-   to the requesting session and returns the exact message to sign.
-2. Wallet signs the message; client posts `{ accountId, publicKey, signature,
-   nonce }` to `POST /api/v1/auth/near/verify`.
-3. Server verifies the signature, consumes the nonce, and issues the httpOnly
-   session cookies described above.
+## NEAR Wallet Challenge / Nonce Flow
 
-### Domain-separated challenge message
+The Mobile NEAR wallet bottom-sheet signs a server-issued challenge. The
+challenge is domain-separated and bound to the requesting `account_id` so a
+signature cannot be replayed against another account or origin.
 
-The signed message must be domain-separated so a signature captured on one
-origin cannot be replayed against another. Bind the nonce, the NEAR
-`account_id`, the audience domain, and an expiry into the message:
+### Challenge issuance
 
 ```typescript
-function buildChallengeMessage(params: {
-  domain: string;      // config.NEAR_AUTH_DOMAIN, e.g. "tycoon.example"
-  accountId: string;   // NEAR account_id the wallet will sign as
-  nonce: string;       // server-issued, single-use
-  issuedAt: number;    // epoch ms
-  expiresAt: number;   // epoch ms
-}): string {
-  return [
-    `${params.domain} wants you to sign in with your NEAR account:`,
-    params.accountId,
-    '',
-    `Nonce: ${params.nonce}`,
-    `Issued At: ${new Date(params.issuedAt).toISOString()}`,
-    `Expiration Time: ${new Date(params.expiresAt).toISOString()}`,
-  ].join('\n');
-}
+// Domain-separated, account-bound, single-use nonce.
+const nonce = randomBytes(32).toString('hex');
+const message = [
+  `${NEAR_AUTH_DOMAIN} wants you to sign in with your NEAR account:`,
+  accountId,
+  `Nonce: ${nonce}`,
+  `Issued At: ${new Date().toISOString()}`,
+].join('\n');
+
+await this.challengeStore.set(nonce, { accountId, message }, NEAR_CHALLENGE_TTL_SECONDS);
 ```
 
-### Verification rules (fail-closed)
+### Throttling
 
-- Recompute the message server-side from the stored nonce; never trust a
-  client-supplied message string.
-- Verify the signature against the submitted `publicKey` and confirm the
-  derived implicit/explicit `account_id` matches the claimed `accountId`.
-- Reject if the nonce is unknown, already consumed, or past
-  `NEAR_CHALLENGE_TTL_SECONDS`.
-- Consume the nonce atomically (single-use) before issuing cookies; a replayed
-  nonce must fail even under concurrent requests.
-- On any verification failure, do not issue cookies and do not leak which check
-  failed.
+Challenge issuance is rate-limited per IP and per `account_id` using the
+windowed counters below. Exceeding the window returns `429 Too Many Requests`
+and does not mint a nonce.
 
 ```typescript
-// Sketch: consume-then-verify ordering keeps replay impossible
-const challenge = await this.nonceStore.consume(nonce); // atomic, throws if used/expired
-if (!challenge || challenge.accountId !== accountId) {
-  throw new UnauthorizedException('Invalid challenge');
-}
-const message = buildChallengeMessage({ domain, accountId, nonce, ...challenge });
-const ok = await verifyNearSignature({ message, publicKey, signature });
-if (!ok) throw new UnauthorizedException('Invalid signature');
+await this.throttle.assertWithinLimit({
+  key: `near-challenge:${ip}:${accountId}`,
+  max: NEAR_CHALLENGE_MAX_PER_WINDOW,
+  windowSeconds: NEAR_CHALLENGE_WINDOW_SECONDS,
+});
 ```
 
-### Challenge throttling
+### Signature verification
 
-Challenge issuance is rate-limited per IP and per `accountId` to prevent
-enumeration and nonce-farming:
+```typescript
+// 1. Nonce must exist and be unconsumed (single-use).
+const challenge = await this.challengeStore.consume(nonce);
+if (!challenge) throw new UnauthorizedException('Unknown or replayed nonce');
 
-- `NEAR_CHALLENGE_MAX_PER_WINDOW` requests per `NEAR_CHALLENGE_WINDOW_SECONDS`.
-- Exceeding the limit returns `429 Too Many Requests` and does not issue a nonce.
-- Throttle counters live in Redis; if Redis is unavailable, challenge issuance
-  fails closed (no nonce issued) rather than degrading to unlimited.
+// 2. The signed message must match the issued, domain-separated message.
+if (signedMessage !== challenge.message) {
+  throw new UnauthorizedException('Challenge mismatch');
+}
 
-## Testing
+// 3. The signature must verify against the bound account_id public key.
+const ok = await verifyNearSignature({
+  accountId: challenge.accountId,
+  message: challenge.message,
+  publicKey,
+  signature,
+});
+if (!ok) throw new UnauthorizedException('Invalid NEAR signature');
+```
 
-### Running Security Tests
+Failure modes handled here:
 
-```bash
-# 
+- **User rejects sign** — no signature is returned; the client surfaces the
+  rejection and the nonce is left to expire (never auto-consumed).
+- **Replayed nonce** — `consume` is atomic; a second use finds no entry and is
+  rejected.
+- **Forged account session** — the signature is bound to `account_id` and the
+  domain-separated message, so a signature for one account/origin cannot mint a
+  session for another.
 
-/* … truncated 6004 chars — edit only what you need near the top … */
+## Troubleshooting
+
+### "Token reuse detected" errors
+
+This means a refresh token was used more than once. Causes:
+
+- Parallel refresh requests from the same client (serialize refreshes).
+- A stolen token being replayed (family is revoked; user must re-auth).
+
+### Cookies not being set
+
+- Confirm `AUTH_COOKIE_SECURE` matches the transport (TLS in prod).
+- Confirm `AUTH_COOKIE_DOMAIN` covers the API host.
+- Confirm the client sends `credentials: 'include'`.
+
+### CSRF 403 on mutations
+
+- Ensure the `CSRF_COOKIE_NAME` cookie is present and echoed in
+  `CSRF_HEADER_NAME`.
+- The CSRF cookie is intentionally not httpOnly so the client can read it.

@@ -41,8 +41,44 @@ Soroban/NEAR boundary. It is the acceptance path for issue #1809.
 12. **Mobile** — Open the bottom menu; NEAR block should appear at the bottom of the sheet
     with **Connect NEAR** / account + disconnect.
 
+## Mobile NEAR wallet bottom-sheet automation notes
+
+Automate the mobile bottom-sheet NEAR block (step 12) so the checklist is enforced in CI
+rather than by hand. These notes are the source of truth for the automation; keep them in
+sync with the RTL specs and the e2e suite named in the test plan.
+
+### Selectors (stable test hooks)
+
+- Bottom-sheet trigger: `data-testid="mobile-bottom-sheet-trigger"`.
+- Sheet container: `data-testid="mobile-bottom-sheet"`.
+- NEAR block (must be the last child of the sheet): `data-testid="mobile-near-block"`.
+- Connect button: `data-testid="mobile-near-connect"`.
+- Account pill: `data-testid="mobile-near-account"` (full account id in `title`).
+- Disconnect button: `data-testid="mobile-near-disconnect"`.
+
+### RTL coverage (wallet reject path)
+
+- Open the sheet, assert `mobile-near-block` is the last child of `mobile-bottom-sheet`.
+- Click `mobile-near-connect`, reject the signature in the mocked wallet, and assert the
+  reject toast (*transaction was not signed; connect and approve to continue*) renders and
+  that no session cookie is set (`document.cookie` does not expose an access token).
+- Assert the account pill shows the truncated id and exposes the full id via `title`.
+- Click `mobile-near-disconnect` and assert the pill is removed and `mobile-near-connect`
+  returns.
+
+### e2e coverage
+
+- `auth.e2e`: challenge/nonce issuance, single-use consumption, and replay rejection.
+- `auth-token-security.e2e`: httpOnly/Secure/SameSite cookie, no JS-readable access token,
+  refresh rotation, and reuse detection revoking the refresh family.
+- Mobile viewport run: bottom-sheet NEAR block placement, connect/disconnect, and the
+  reject path above.
+
 ### Failure modes to verify
 
 - Dependency outage (Postgres/Redis/shop-api/RPC): writes fail closed, no partial state.
 - Forbidden role access: admin/WS/action surfaces deny by default.
 - Oversized or adversarial payloads: rejected without leaking tokens or PII in logs.
+- Concurrent duplicate requests / reconnect retries: idempotent, no duplicate games or claims.
+- Auth expiry mid-flow: silent rotation, or forced re-login on reuse detection.
+- Open redirect attempts: `returnTo` off the allowlist is refused.
