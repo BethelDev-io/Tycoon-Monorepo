@@ -3,7 +3,8 @@
 **Status:** Decided  
 **Date:** 2026-08-26  
 **Author:** Backend Team  
-**Issue:** #1432
+**Issue:** #1432  
+**Related:** #1710 (Ledger reconciliation admin tools for shop and pots)
 
 ## Problem Statement
 
@@ -55,6 +56,26 @@ This approach:
 
 ---
 
+## Authoritative Write Path (issue #1710)
+
+For ledger reconciliation of **shop purchases and pots**, the authoritative write path is:
+
+| Concern | Authoritative system | Notes |
+|---|---|---|
+| Purchase creation / money movement | **shop-api** (`POST /purchases`) | Only writer of purchase + ledger rows |
+| Pot contributions / payouts | **shop-api** (`POST /pots/:id/contributions`, `POST /pots/:id/payouts`) | Same idempotency + ledger guarantees |
+| Inventory decrement | **shop-api** (transactional, row-locked) | Backend never mutates inventory directly |
+| Idempotency records | **shop-api** (`IdempotencyService`, PostgreSQL) | Backend Redis cache is a read-through only |
+| Admin reconciliation reads | **backend** read model (`GET /admin/ledger/reconciliation`) | Proxy/read model; never writes |
+| Admin catalog mutations | **backend** (`/admin/shop/*`) | Audited; forwarded to shop-api for price/SKU SoT |
+
+**Backend proxy / read models:**
+- `POST /shop/purchase` → proxy to shop-api `POST /purchases` (write path).
+- `GET /admin/ledger/reconciliation` → backend read model that joins shop-api purchase ledger with pot ledger snapshots. Read-only; safe to serve from a replica.
+- `GET /admin/ledger/reconciliation/:id` → single-entry drill-down; must include `requestId` for cross-service tracing.
+
+**Fail-closed rule:** if shop-api is unreachable, times out (>5s), or returns 5xx, the backend MUST return `503 Service Unavailable` and MUST NOT fall back to local writes. Reconciliation reads may serve stale data with an explicit `stale: true` marker, but writes never degrade.
+
 ## Feature Flags (Issue #1806)
 
 The proxy cutover and the Stellar UI gate are controlled by the authoritative,
@@ -84,6 +105,20 @@ the Stellar UI stays gated and the games WS surface stays closed.
   optimistic defaults; it returns the disabled snapshot.
 - Enabling a flag is an explicit, audited operator action; there is no
   client-supplied override.
+
+---
+
+## Implementation Plan
+
+### Phase 1: Service Contract (Week 1)
+1. **Document the contract** for shop-api's `POST /purchases`:
+   - Required headers: `Idempotency-Key` (UUID, max 255 chars)
+   - Request body: `{ userId, itemId, amount, currency, metadata? }`
+   - Success response: 201 with `{ id, userId, itemId, amount, createdAt, ... }`
+   - Replay response: 201 with `x-idempotency-replayed: true` header
+   - Concurrent duplicate: 409 with message "Request is still being processed"
+
+2. **
 
 ---
 
@@ -213,6 +248,41 @@ Authorization: Bearer <user-jwt>
 - Same key in both requests → shop-api deduplicates
 - shop-api's idempotency record acts as the authoritative cache
 - Backend never creates local duplicates (all writes go through shop-api)
+
+### Idempotency-Key + body hash (issue #1710)
+
+To prevent key reuse with a different payload (a common reconciliation break), shop-api stores a hash of the canonical request body alongside the idempotency key:
+
+1. On first request: compute `bodyHash = sha256(canonicalJson(body))`, persist `(key, bodyHash, response, status, expiresAt)`.
+2. On replay with the **same** key and **same** `bodyHash`: return the stored response with `x-idempotency-replayed: true` (no new ledger rows).
+3. On replay with the **same** key but a **different** `bodyHash`: return **409 Conflict** with `code: IDEMPOTENCY_KEY_REUSED` — never overwrite the stored response.
+4. TTL: idempotency records expire after 24h. After expiry, a reused key is treated as a new request; operators must reconcile via the admin tooling below.
+
+---
+
+## Inventory Atomicity (issue #1710)
+
+Concurrent buys of the same SKU must never oversell and inventory must never go negative:
+
+- Inventory decrement happens **inside the same shop-api transaction** as the purchase insert.
+- The row is locked with `SELECT ... FOR UPDATE` (or an equivalent `UPDATE ... WHERE quantity >= :qty` guarded statement) so two concurrent transactions serialize.
+- If the guarded update affects 0 rows, shop-api returns **409 Conflict** with `code: INSUFFICIENT_INVENTORY` and rolls back — no partial ledger entry.
+- Optional reservation TTL: a short-lived reservation row (`expiresAt`) holds stock during checkout; expired reservations are released by a sweeper and are visible in the reconciliation read model.
+
+---
+
+## Admin Reconciliation Tooling (issue #1710)
+
+Operators reconcile shop and pot ledgers through backend admin endpoints (deny-by-default, admin role required, every mutation audited):
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/admin/ledger/reconciliation` | GET | List purchase/pot ledger entries with filters (`status`, `from`, `to`, `sku`, `potId`) |
+| `/admin/ledger/reconciliation/:id` | GET | Drill-down for a single entry, including `requestId` and idempotency key |
+| `/admin/ledger/reconciliation/:id/notes` | POST | Attach an operator note (audited) |
+| `/admin/ledger/reconciliation/:id/resolve` | POST | Mark an entry reconciled (audited, idempotent) |
+
+All admin responses propagate `requestId` and follow `docs/API_ERROR_RESPONSE_STANDARDS.md`. RED metrics (`ledger_reconciliation_requests_total`, `_errors_total`, `_duration_seconds`) are emitted for every admin call.
 
 ---
 
