@@ -1,4 +1,8 @@
-# ADR-001: Shop Purchase Write Path Ownership — Backend vs shop-api
+# ADR-001: Shop Purchase Ownership (Authoritative Write Path)
+
+- Status: Accepted
+- Date: 2024-01-01
+- Related: ADR-003 (NEAR wallet is the only supported chain UI), `docs/API_ERROR_RESPONSE_STANDARDS.md`, `docs/SHOP_PURCHASES_RUNBOOK.md`
 
 **Status:** Decided  
 **Date:** 2026-08-26  
@@ -6,198 +10,72 @@
 **Issue:** #1432  
 **Related:** #1710 (Ledger reconciliation admin tools for shop and pots)
 
-## Problem Statement
+## Context
 
-The codebase currently has two independent purchase write paths:
+Tycoon has two server-side surfaces that can touch purchase state:
 
-1. **Backend** (`backend/src/modules/shop/shop.controller.ts` → `POST /shop/purchase`)
-   - Handles HTTP requests, idempotency, inventory updates
-   - Uses `IdempotencyInterceptor` + Redis for exactly-once semantics
-   - Stores purchases directly in the backend database
+- `shop-api` (NestJS): the purchases system-of-record (SoT). Owns SKU catalog reads, inventory mutation, idempotency records, and purchase persistence.
+- `backend` (NestJS): the general API. May expose read models and a thin proxy for shop operations, but must not own purchase state.
 
-2. **shop-api** (`shop-api/src/purchases/purchases.controller.ts` → `POST /purchases`)
-   - Duplicate purchase creation, idempotency implementation
-   - Uses `IdempotencyService` + PostgreSQL for key management
-   - Stores purchases in a separate shop-api database
-
-**Consequences of dual-write paths:**
-- Purchase logic is implemented twice (maintenance burden)
-- No single source of truth for the business logic
-- Risk of divergence: bugfixes in one path don't reach the other
-- Silent dual-writes are possible if both paths are called
-- Schema drift between backend and shop-api databases
-- Complex audit trail when purchases touch both systems
-
-**Example failure mode:**  
-If a client sends a purchase request to both endpoints with the same idempotency key, they could get two distinct purchase IDs back, causing an inventory mismatch and audit confusion.
-
----
+Without an explicit decision, purchase writes can be duplicated across surfaces, inventory can be adjusted twice, and error envelopes can diverge between `backend` and `shop-api`.
 
 ## Decision
 
-**Adopt the Proxy Pattern: Backend proxies all purchase writes to shop-api.**
+1. **`shop-api` is the authoritative write path for all purchases.** Every purchase mutation (create, refund, inventory adjustment) is executed by `shop-api` against its own datastore. No other service writes purchase or inventory state directly.
 
-### Rationale
+2. **`backend` is read-only for purchases.** It may expose read models (catalog, purchase history) and, if needed, a thin proxy that forwards to `shop-api`. A proxy must:
+   - Forward the caller's `Idempotency-Key` unchanged.
+   - Propagate `requestId` on both success and error responses.
+   - Never trust client-supplied price, SKU totals, or inventory counts.
+   - Fail closed on writes when `shop-api` is unavailable (return an error envelope, do not fall back to local writes).
 
-| Option | Pros | Cons | Risk |
-|--------|------|------|------|
-| **Proxy** | Single write path; shop-api is the source of truth; no merge needed; gradual cutover | Extra network hop; service dependency; requires client migration | Mitigated by explicit contract + canary testing |
-| **Merge** | One codebase; no network dependency; simpler deployment | Disruptive; requires schema consolidation; larger refactor | Breaks existing shop-api clients; slower rollout |
-| **Split** | Services stay independent | No single source of truth; dual-write risk; hard to audit | Unacceptable — violates the constraint |
+3. **Error envelope is shared.** Both `backend` and `shop-api` MUST emit the envelope defined in `docs/API_ERROR_RESPONSE_STANDARDS.md`:
 
-**Chosen: Proxy.**
-
-This approach:
-1. **Eliminates dual-writes** — all writes flow through shop-api
-2. **Preserves existing shop-api clients** — they continue calling `POST /shop-api/purchases`
-3. **Unifies backend clients** — they call `POST /shop/purchase`, which proxies internally
-4. **Enables gradual migration** — canary testing + monitoring before full cutover
-5. **Single source of truth** — purchase records, idempotency state, and metadata live in shop-api
-
----
-
-## Authoritative Write Path (issue #1710)
-
-For ledger reconciliation of **shop purchases and pots**, the authoritative write path is:
-
-| Concern | Authoritative system | Notes |
-|---|---|---|
-| Purchase creation / money movement | **shop-api** (`POST /purchases`) | Only writer of purchase + ledger rows |
-| Pot contributions / payouts | **shop-api** (`POST /pots/:id/contributions`, `POST /pots/:id/payouts`) | Same idempotency + ledger guarantees |
-| Inventory decrement | **shop-api** (transactional, row-locked) | Backend never mutates inventory directly |
-| Idempotency records | **shop-api** (`IdempotencyService`, PostgreSQL) | Backend Redis cache is a read-through only |
-| Admin reconciliation reads | **backend** read model (`GET /admin/ledger/reconciliation`) | Proxy/read model; never writes |
-| Admin catalog mutations | **backend** (`/admin/shop/*`) | Audited; forwarded to shop-api for price/SKU SoT |
-
-**Backend proxy / read models:**
-- `POST /shop/purchase` → proxy to shop-api `POST /purchases` (write path).
-- `GET /admin/ledger/reconciliation` → backend read model that joins shop-api purchase ledger with pot ledger snapshots. Read-only; safe to serve from a replica.
-- `GET /admin/ledger/reconciliation/:id` → single-entry drill-down; must include `requestId` for cross-service tracing.
-
-**Fail-closed rule:** if shop-api is unreachable, times out (>5s), or returns 5xx, the backend MUST return `503 Service Unavailable` and MUST NOT fall back to local writes. Reconciliation reads may serve stale data with an explicit `stale: true` marker, but writes never degrade.
-
-## Feature Flags (Issue #1806)
-
-The proxy cutover and the Stellar UI gate are controlled by the authoritative,
-server-side feature flag service (`backend/src/modules/feature-flags`). Flags are
-**deny-by-default**: an unknown flag, a missing flag, or a flag store outage
-(Postgres/Redis) resolves to `disabled`. Clients must never be trusted to decide
-whether a surface is enabled.
-
-| Flag | Default | Gates |
-|------|---------|-------|
-| `SHOP_PURCHASES_BACKEND_PROXY_ENABLED` | `false` | Backend `POST /shop/purchase` proxies writes to shop-api instead of legacy local logic |
-| `SHOP_PROXY_GAMES_WS_ENABLED` | `false` | Shop proxy games WebSocket surface (deny-by-default; disabled until explicitly enabled) |
-| `STELLAR_UI_ENABLED` | `false` | Stellar UI gate. Per ADR-003, NEAR remains the only supported chain UI until this flag is explicitly enabled |
-
-### Read path for the frontend
-
-The frontend must not infer Stellar availability from client state. It reads the
-evaluated flags from the backend read endpoint (`GET /feature-flags`), which
-returns the server-evaluated values. If the flag service cannot reach its
-dependencies, the endpoint returns the deny-by-default values (all `false`) so
-the Stellar UI stays gated and the games WS surface stays closed.
-
-### Fail-closed behavior
-
-- Flag evaluation errors (Postgres/Redis outage, timeout) → flag resolves to `false`.
-- The read endpoint never throws a 5xx that would let a client fall back to
-  optimistic defaults; it returns the disabled snapshot.
-- Enabling a flag is an explicit, audited operator action; there is no
-  client-supplied override.
-
----
-
-## Implementation Plan
-
-### Phase 1: Service Contract (Week 1)
-1. **Document the contract** for shop-api's `POST /purchases`:
-   - Required headers: `Idempotency-Key` (UUID, max 255 chars)
-   - Request body: `{ userId, itemId, amount, currency, metadata? }`
-   - Success response: 201 with `{ id, userId, itemId, amount, createdAt, ... }`
-   - Replay response: 201 with `x-idempotency-replayed: true` header
-   - Concurrent duplicate: 409 with message "Request is still being processed"
-
-2. **
-
----
-
-## Implementation Plan
-
-### Phase 1: Service Contract (Week 1)
-1. **Document the contract** for shop-api's `POST /purchases`:
-   - Required headers: `Idempotency-Key` (UUID, max 255 chars)
-   - Request body: `{ userId, itemId, amount, currency, metadata? }`
-   - Success response: 201 with `{ id, userId, itemId, amount, createdAt, ... }`
-   - Replay response: 201 with `x-idempotency-replayed: true` header
-   - Concurrent duplicate: 409 with message "Request is still being processed"
-
-2. **Auth & schema alignment:**
-   - shop-api must accept backend JWT tokens (or use internal service-to-service auth)
-   - shop-api's `userId` ↔ backend's user context mapping
-   - shop-api's `itemId` ↔ backend's `shop_item_id` naming consistency
-   - shop-api's schema must include all fields needed by backend (price, currency, metadata)
-
-### Phase 2: Proxy Implementation (Week 2)
-1. **Create a purchase proxy in backend** (`backend/src/modules/shop/shop-api-proxy.service.ts`):
-   ```typescript
-   async proxyCreatePurchase(
-     userId: number,
-     createPurchaseDto: CreatePurchaseDto,
-     idempotencyKey: string,
-   ): Promise<Purchase> {
-     const response = await this.httpClient.post(
-       `${SHOP_API_URL}/purchases`,
-       {
-         userId,
-         itemId: createPurchaseDto.shop_item_id,
-         amount: createPurchaseDto.final_price,
-         currency: createPurchaseDto.currency,
-         metadata: { ... },
-       },
-       {
-         headers: { 'Idempotency-Key': idempotencyKey },
-       },
-     );
-     return this.mapShopApiResponse(response);
+   ```json
+   {
+     "error": {
+       "code": "STRING_CODE",
+       "message": "Human readable message",
+       "requestId": "<propagated request id>",
+       "details": { }
+     }
    }
    ```
 
-2. **Update `POST /shop/purchase`:**
-   - Maintain the same external contract (no client changes needed)
-   - Extract idempotency key from request header
-   - Delegate to proxy service instead of local `PurchaseService`
-   - Handle shop-api errors and map to HTTP responses
+   - `code` is a stable, machine-readable string (e.g. `VALIDATION_FAILED`, `IDEMPOTENCY_CONFLICT`, `DEPENDENCY_UNAVAILABLE`).
+   - `requestId` is always present and matches the value in logs for the same request.
+   - `details` is optional and must not contain secrets, tokens, or PII.
 
-3. **Feature flag** (env var: `SHOP_PURCHASES_BACKEND_PROXY_ENABLED`):
-   - `true` → use proxy (shop-api as source of truth)
-   - `false` → use legacy backend logic (for rollback)
+4. **Idempotency.** Purchase writes require an `Idempotency-Key` header. `shop-api` stores the key together with a hash of the request body:
+   - Replay with the same key and same body hash returns
+   }
+   ```
 
-### Phase 3: Testing & Canary (Week 3)
-1. **Unit tests** for the proxy service (mock shop-api HTTP calls)
-2. **Integration tests** calling `POST /shop/purchase` end-to-end
-3. **Canary traffic**:
-   - 5% of production requests → proxy
-   - 95% of production requests → legacy backend logic
-   - Monitor error rates, latency, idempotency key collisions
-4. **Full cutover** once metrics are stable for 1 week
+   - `code` is a stable, machine-readable string (e.g. `VALIDATION_FAILED`, `IDEMPOTENCY_CONFLICT`, `DEPENDENCY_UNAVAILABLE`).
+   - `requestId` is always present and matches the value in logs for the same request.
+   - `details` is optional and must not contain secrets, tokens, or PII.
 
-### Phase 4: Cleanup (Week 4)
-1. Remove legacy `PurchaseService.createPurchase()` logic
-2. Deprecate the `IdempotencyInterceptor` in backend (shop-api owns it now)
-3. Update `SHOP_PURCHASES_RUNBOOK.md` to reference shop-api as source of truth
-4. Archive backend's purchase tables (or drop after 30-day retention policy)
+4. **Idempotency.** Purchase writes require an `Idempotency-Key` header. `shop-api` stores the key together with a hash of the request body:
+   - Replay with the same key and same body hash returns the stored response.
+   - Replay with the same key and a different body hash returns `409` with code `IDEMPOTENCY_CONFLICT`.
+   - Keys expire per the TTL documented in `docs/SHOP_PURCHASES_RUNBOOK.md`; after expiry a new request is treated as a fresh purchase.
 
----
+5. **Inventory integrity.** Inventory adjustments are atomic (constraint or reservation with TTL) so concurrent purchases of the same SKU cannot oversell. Inventory must never go negative.
 
-## Auth & Service-to-Service Communication
+6. **Fail-closed on dependency outage.** If Postgres, Redis, `shop-api`, or the RPC dependency is unavailable, purchase writes return an error envelope with code `DEPENDENCY_UNAVAILABLE` and HTTP `503`. Reads may degrade, writes must not.
 
-### Option A: Backend → shop-api via JWT
-- Backend extracts user's JWT from the incoming request
-- Backend forwards JWT to shop-api in proxy call
-- shop-api validates JWT using the same secret
-- ✅ Simple; reuses existing JWT infrastructure
-- ⚠️ Exposes user tokens to shop-api (mitigated by mTLS)
+## Consequences
+
+- A single writer (`shop-api`) makes inventory and idempotency reasoning tractable.
+- `backend` proxy code stays thin and testable; contract tests assert envelope and `requestId` propagation.
+- Operators have one runbook (`docs/SHOP_PURCHASES_RUNBOOK.md`) for purchase incidents.
+- Any future service that needs to mutate purchases must go through `shop-api` or supersede this ADR.
+
+## Out of scope
+
+- Mainnet irreversible deploys without a readiness issue.
+- Unrelated package refactors.
+- Stellar chain UI (gated by ADR-003; NEAR remains the only supported chain UI).
 
 ### Option B: Backend → shop-api via Service Token
 - Backend has its own service account in shop-api's auth system
