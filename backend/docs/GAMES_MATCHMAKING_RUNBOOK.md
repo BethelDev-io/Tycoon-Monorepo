@@ -131,9 +131,16 @@ Games use Redis for real-time state and caching. To inspect a game's cache:
 -   Command: `KEYS *matchmaking*` (to see active matchmaking attempts)
 
 ### Handling AI Player Issues
+
+AI opponent turns execute through the **same shared rule engine** as human turns. There is no AI-only rule path: dice, movement, rent, purchases, and turn advancement are computed server-side by the shared engine, and the AI only supplies a decision (e.g. roll / buy / pass) that is validated against the same invariants as a human action. This is the **AI vs human parity invariant** — any divergence is a bug, not a feature.
+
 If AI players are not moving:
 -   Check the `jobs` module to ensure the AI worker is running.
 -   Check logs for `GamePlayersService.rollDice` for AI player IDs.
+-   Confirm the AI turn was dispatched through the shared rule engine (look for the same `requestId`/correlation id used for human turns) rather than a divergent AI-only code path.
+-   If the AI decision is rejected, the engine must fail closed: the turn is **not** advanced and the rejection is logged with the correlation id and an explicit error code (see `docs/API_ERROR_RESPONSE_STANDARDS.md`).
+
+**Authz note:** AI turns are server-authoritative. Clients cannot trigger, spoof, or advance an AI turn; the WebSocket seat check and JWT authz apply to AI seats exactly as they do to human seats. A client attempting to act on an AI seat must be rejected (deny-by-default).
 
 ## Monitoring & Metrics
 -   **Metric**: `tycoon_games_active_total` - Gauge of currently running games.
@@ -142,6 +149,8 @@ If AI players are not moving:
 -   **Metric**: `tycoon_games_transition_total` - Counter of `PENDING → RUNNING` transitions, labelled by outcome.
 -   **Metric**: `tycoon_stake_lock_failures_total` - Counter of failed stake locks (fail-closed writes).
 -   **Metric**: `tycoon_idempotency_hits_total` - Monitor how often replay protection is triggered.
+-   **Metric**: `tycoon_ai_turn_duration_seconds` - Histogram of AI turn execution time through the shared rule engine.
+-   **Metric**: `tycoon_ai_turn_rejections_total` - Counter of AI decisions rejected by the shared engine (parity/authz failures); alert on sustained non-zero rate.
 -   **Metric**: `tycoon_games_roll_rejected_total` - Counter of rejected rolls (off-turn, rate-limited, or client-supplied outcomes).
 -   **Metric**: `tycoon_games_ws_connections_total` - Gauge of active WebSocket connections on `/games`.
 

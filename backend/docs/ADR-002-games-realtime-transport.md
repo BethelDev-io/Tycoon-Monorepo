@@ -133,6 +133,25 @@ The gateway is the single realtime entry point for matchmaking, turns, and dice.
 - Multi-instance deployments scale through the Redis adapter.
 - Clients must handle handshake rejection, off-turn errors, and reconnect.
 
+### AI Opponent Turns — Shared Rule Engine Parity (Issue #1703)
+
+AI opponent turns MUST execute through the **same shared rule engine** as human turns. There is no AI-only rule path.
+
+**Parity invariants:**
+1. **Single rule engine** — both human and AI turns are resolved by the shared rule engine (dice, movement, rent, purchases, bankruptcy). AI never mutates board state directly.
+2. **Server authority** — the server is the sole source of truth for dice, money, inventory, and turn mutations. AI decisions are computed server-side only; clients cannot submit, spoof, or replay AI actions.
+3. **Same event surface** — AI turns emit the same `turn` / `roll` events as human turns, so clients render AI and human turns identically.
+4. **Deterministic inputs** — AI decisions are derived from the same server-side game state snapshot the rule engine consumes for human turns; no privileged state access.
+5. **Idempotency** — AI turn advancement is keyed by `(gameId, turnIndex)` so duplicate/reconnect retries cannot double-apply a turn.
+
+**Authz:** AI turns are triggered only by server-side scheduling or an authenticated, authorized caller (JWT / AdminGuard / API-key / WS seat check). Untrusted clients cannot trigger or spoof AI turns; deny-by-default for any new AI-turn entrypoint.
+
+**Error mapping:** AI-turn failures surface typed errors with explicit codes per `docs/API_ERROR_RESPONSE_STANDARDS.md`, including `requestId`/correlation for observability. Writes fail closed on dependency outage (Postgres/Redis/RPC).
+
+**Rollout:** AI-turn execution is gated behind a feature flag/kill switch; rollback disables AI turns without affecting human turn handling.
+
+---
+
 ## Explicit Out of Scope
 
 - **Frontend client implementation** (`useGameBoardLogic` wiring) — this ADR defines the backend gateway only; frontend updates are a follow-up.
